@@ -395,3 +395,107 @@ free(header);
 #### Fat objects
 
 The article is already way too big, so I’m not going to describe how to handle Fat objects, but you can find implementation here: [segment_dumper](https://github.com/AlexDenisov/segment_dumper)
+
+
+
+
+
+
+
+main 函数是 iOS 程序的入口，我们写的代码都是在 main 函数之后执行的，但是在夜深人静的时候，我的脑海中经常会冒出这样的问题：main 函数之前到底发生了什么？用户点击程序图标之后，我们的 App 是怎样被启动的？这期间系统做了哪些事情、经历了哪些步骤才一步步地调用到程序 main 函数的？于是我又献祭了自己的空闲时间对 iOS 应用的启动流程进行了一番探究。
+
+## 调研结论
+
+咳咳，这里先把结论贴出来，然后再一步步分析，对总体流程有了一个大体的认识才不会在技术细节中迷路：
+
+(1) 系统为程序启动做好准备
+
+(2) 系统将控制权交给 Dyld，Dyld 会负责后续的工作
+
+(3) Dyld 加载程序所需的动态库
+
+(3) Dyld 对程序进行 rebase 以及 bind 操作
+
+(4) Objc SetUp
+
+(5) 运行初始化函数
+
+(6) 执行程序的 main 函数
+
+步骤比较多，不过不用担心，我会结合代码对其进行进一步的讲解。
+
+## Dyld
+
+在用户点击应用后，系统内核会去创建一个新的进程并为应用的执行做好准备，详情可参考[趣探 Mach-O：加载过程](https://link.juejin.im/?target=http%3A%2F%2Fwww.jianshu.com%2Fp%2F8498cec10a41)，之后会去调用 Dyld 来接管后续的工作。Dyld 是 iOS 系统的动态链接器，它的代码在[这里](https://link.juejin.im/?target=https%3A%2F%2Fopensource.apple.com%2Fsource%2Fdyld%2F)，整体来说它的机制还是比较复杂的，所里这里只是简单概括一下，感兴趣的同志可以下载源码阅读。
+
+Dyld 的启动代码源于 dyldStartup.s 文件，在一大串的汇编代码中有个名为 __dyld_start 的方法，它会去调用 dyldbootstrap::start() 方法，然后进一步调用 dyld::_main() 方法，里面包含 App 的整个启动流程，该函数最终返回应用程序 main 函数的地址，最后 Dyld 会去调用它。dyld::_main() 函数的源码很长，所以这里只保留关键信息，并用伪代码进行简化从而得到整体流程：
+
+```
+
+```
+
+接下来我会对以上关键代码进行解读，希望大家对启动流程有着更为清晰的认识。
+
+## 加载可执行文件
+
+二进制文件常被称为 image，包括可执行文件、动态库等，ImageLoader 的作用就是将二进制文件加载进内存。dyld::_main() 方法在设置好运行环境后，会调用 instantiateFromLoadedImage 函数将可执行文件加载进内存中，加载过程分为三步：
+
+1. 合法性检查。主要是检查可执行文件是否合法，是否能在当前的 CPU 架构下运行。
+2. 选择 ImageLoader 加载可执行文件。系统会去判断可执行文件的类型，选择相应的 ImageLoader 将其加载进内存空间中。
+3. 注册 image 信息。可执行文件加载完成后，系统会调用 addImage 函数将其管理起来，并更新内存分布信息。
+
+以上三步完成后，Dyld 会调用 link 函数开始之后的处理流程。另外补充下，如果有同学对 ImageLoader 感兴趣的话，[dyld 加载 Mach-O](https://link.juejin.im/?target=http%3A%2F%2Fblog.tingyun.com%2Fweb%2Farticle%2Fdetail%2F1346)这篇文章是不错的，推荐大家看。
+
+## Load Dylibs
+
+link(sMainExecutable, ......) 函数究竟做了些什么，我们可以从源码中一探究竟：
+
+```
+
+```
+
+link 函数不是很长，这里就全部贴出来了，它首先调用 recursiveLoadLibraries，递归加载程序所需的动态链接库。使用 `otool -L 二进制文件路径` 可以列出程序的动态链接库：
+
+```
+
+```
+
+UIKit 和 Foundation 框架相信大家已经很熟悉了，那么 libobjc.A.dylib 以及 libSystem.B.dylib 是什么呢？libobjc.A.dylib 包含 runtime，而 libSystem.B.dylib 则包含像 libdispatch、libsystem_c 等系统级别的库，二者都是被默认添加到程序中的。动态链接库的加载也是借助 ImageLoader 完成的，但是由于动态链接库本身还可能依赖其他动态链接库，所以整个加载过程是递归进行的。当程序的动态链接库加载完毕后，link 函数进入下一流程。
+
+## Rebase && Bind
+
+因为地址空间加载随机化(ASLR，Address Space Layout Randomization)的缘故，二进制文件最终的加载地址与预期地址之间会存在偏移，所以需要进行 rebase 操作，对那些指向文件内部符号的指针进行修正，在 link 函数中该项操作由 recursiveRebase 函数执行。rebase 完成之后，就会进行 bind 操作，修正那些指向其他二进制文件所包含的符号的指针，由 recursiveBind 函数执行。
+
+当 rebase 以及 bind 结束时，link 函数就完成了它的使命，iOS 应用的启动流程也进入到下一阶段，即 Objc SetUp。
+
+## Objc SetUp
+
+Objc Setup 算是 iOS 系统独有的流程了，在 runtime 的初始化函数 _objc_init 中，有这样的代码：
+
+```
+
+```
+
+Dyld 在 bind 操作结束之后，会发出 dyld_image_state_bound 通知，然后与之绑定的回调函数 map_2_images 就会被调用，它主要做以下几件事来完成 Objc Setup：
+
+1. 读取二进制文件的 DATA 段内容，找到与 objc 相关的信息
+2. 注册 Objc 类
+3. 确保 selector 的唯一性
+4. 读取 protocol 以及 category 的信息
+
+除了 map_2_images，我们注意到 _objc_init 还注册了 load_images 函数，它的作用就是调用 Objc 的 + load 方法，它监听 dyld_image_state_dependents_initialized 通知。
+
+虽然我说的很简单，但是在读源码的时候，我发现这部分内容其实是十分复杂而又十分有趣的，鉴于本文主旨是讲启动流程，所以这一块内容先放下，以后有时间了再讲。
+
+## Initializers
+
+Objc SetUp 结束后，Dyld 便开始运行程序的初始化函数，该任务由 initializeMainExecutable 函数执行。整个初始化过程是一个递归的过程，顺序是先将依赖的动态库初始化，然后在对自己初始化。初始化需要做的事情包括：
+
+1. 调用 Objc 类的 + load 函数
+2. 调用 C++ 中带有 constructor 标记的函数
+3. 非基本类型的 C++ 静态全局变量的创建
+
+## main
+
+当初始化结束之后，可执行文件才处于可用状态，之后 Dyld 就会去调用可执行文件的 main 函数，开始程序的运行。
+
