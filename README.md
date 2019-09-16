@@ -431,7 +431,32 @@ main 函数是 iOS 程序的入口，我们写的代码都是在 main 函数之�
 Dyld 的启动代码源于 dyldStartup.s 文件，在一大串的汇编代码中有个名为 __dyld_start 的方法，它会去调用 dyldbootstrap::start() 方法，然后进一步调用 dyld::_main() 方法，里面包含 App 的整个启动流程，该函数最终返回应用程序 main 函数的地址，最后 Dyld 会去调用它。dyld::_main() 函数的源码很长，所以这里只保留关键信息，并用伪代码进行简化从而得到整体流程：
 
 ```
+uintptr_t _main(···/省略参数/···) {
+    // 1. 设置运行环境
+    ......
 
+    // 2. instantiate ImageLoader for main executable
+    sMainExecutable = instantiateFromLoadedImage(mainExecutableMH, mainExecutableSlide, sExecPath);   
+
+    ......
+
+    //3. link main executable
+    link(sMainExecutable, sEnv.DYLD_BIND_AT_LAUNCH, true, ImageLoader::RPathChain(NULL, NULL), -1);
+
+    ......
+
+    //4. run all initializers
+    initializeMainExecutable(); 
+
+    ......
+
+    //5. find entry point for main executable
+    result = (uintptr_t)sMainExecutable->getThreadPC();
+
+    ......
+
+    return result;
+}
 ```
 
 接下来我会对以上关键代码进行解读，希望大家对启动流程有着更为清晰的认识。
@@ -451,13 +476,73 @@ Dyld 的启动代码源于 dyldStartup.s 文件，在一大串的汇编代码中
 link(sMainExecutable, ......) 函数究竟做了些什么，我们可以从源码中一探究竟：
 
 ```
+void ImageLoader::link(···/省略参数/···) {
+    //dyld::log("ImageLoader::link(%s) refCount=%d, neverUnload=%d\n", imagePath, fDlopenReferenceCount, fNeverUnload);
 
+    // clear error strings
+    (*context.setErrorStrings)(0, NULL, NULL, NULL);
+
+    uint64_t t0 = mach_absolute_time();
+    this->recursiveLoadLibraries(context, preflightOnly, loaderRPaths, imagePath);
+    context.notifyBatch(dyld_image_state_dependents_mapped, preflightOnly);
+
+    // we only do the loading step for preflights
+    if ( preflightOnly )
+        return;
+
+    uint64_t t1 = mach_absolute_time();
+    context.clearAllDepths();
+    this->recursiveUpdateDepth(context.imageCount());
+
+    uint64_t t2 = mach_absolute_time();
+     this->recursiveRebase(context);
+    context.notifyBatch(dyld_image_state_rebased, false);
+
+    uint64_t t3 = mach_absolute_time();
+     this->recursiveBind(context, forceLazysBound, neverUnload);
+
+    uint64_t t4 = mach_absolute_time();
+    if ( !context.linkingMainExecutable )
+        this->weakBind(context);
+    uint64_t t5 = mach_absolute_time();    
+
+    context.notifyBatch(dyld_image_state_bound, false);
+    uint64_t t6 = mach_absolute_time();    
+
+    std::vector<DOFInfo> dofs;
+    this->recursiveGetDOFSections(context, dofs);
+    context.registerDOFs(dofs);
+    uint64_t t7 = mach_absolute_time();    
+
+    // interpose any dynamically loaded images
+    if ( !context.linkingMainExecutable && (fgInterposingTuples.size() != 0) ) {
+        this->recursiveApplyInterposing(context);
+    }
+
+    // clear error strings
+    (*context.setErrorStrings)(0, NULL, NULL, NULL);
+
+    fgTotalLoadLibrariesTime += t1 - t0;
+    fgTotalRebaseTime += t3 - t2;
+    fgTotalBindTime += t4 - t3;
+    fgTotalWeakBindTime += t5 - t4;
+    fgTotalDOF += t7 - t6;
+
+    // done with initial dylib loads
+    fgNextPIEDylibAddress = 0;
+}
 ```
 
 link 函数不是很长，这里就全部贴出来了，它首先调用 recursiveLoadLibraries，递归加载程序所需的动态链接库。使用 `otool -L 二进制文件路径` 可以列出程序的动态链接库：
 
 ```
+$ otool -L gaoda
 
+/System/Library/Frameworks/Foundation.framework/Foundation (compatibility version 300.0.0, current version 1349.55.0)
+/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)
+/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1238.50.2)
+/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation (compatibility version 150.0.0, current version 1349.56.0)
+/System/Library/Frameworks/UIKit.framework/UIKit 
 ```
 
 UIKit 和 Foundation 框架相信大家已经很熟悉了，那么 libobjc.A.dylib 以及 libSystem.B.dylib 是什么呢？libobjc.A.dylib 包含 runtime，而 libSystem.B.dylib 则包含像 libdispatch、libsystem_c 等系统级别的库，二者都是被默认添加到程序中的。动态链接库的加载也是借助 ImageLoader 完成的，但是由于动态链接库本身还可能依赖其他动态链接库，所以整个加载过程是递归进行的。当程序的动态链接库加载完毕后，link 函数进入下一流程。
@@ -473,7 +558,16 @@ UIKit 和 Foundation 框架相信大家已经很熟悉了，那么 libobjc.A.dyl
 Objc Setup 算是 iOS 系统独有的流程了，在 runtime 的初始化函数 _objc_init 中，有这样的代码：
 
 ```
+void _objc_init(void) {
 
+    ......
+
+    // Register for unmap first, in case some +load unmaps something
+    _dyld_register_func_for_remove_image(&unmap_image);
+    dyld_register_image_state_change_handler(dyld_image_state_bound,
+                                             1/*batch*/, &map_2_images);
+    dyld_register_image_state_change_handler(dyld_image_state_dependents_initialized, 0/*not batch*/, &load_images);
+}
 ```
 
 Dyld 在 bind 操作结束之后，会发出 dyld_image_state_bound 通知，然后与之绑定的回调函数 map_2_images 就会被调用，它主要做以下几件事来完成 Objc Setup：
